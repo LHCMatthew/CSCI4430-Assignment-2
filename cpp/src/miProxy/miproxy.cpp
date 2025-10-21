@@ -412,17 +412,37 @@ int main(int argc, char **argv)
                 std::cout << "Http resquest from client:\n";
                 std::string client_request = readHttpRequest(client_sock);
                 std::cout << client_request << "\n";
+                if (client_request.empty()) 
+                {
+                    std::cout << "Client disconnected, socket fd is " << client_sock << "\n";
+                    close(client_sock);
+                    close(server_conn);
+                    client_sockets[i] = 0;
+                    continue;
+                }
 
                 HttpMessage request;
                 request.parseHttpRequest(client_request);
-                if (request.getMethod() == "POST") 
+                if (request.getMethod() == "GET")
                 {
-                    int x_fragment_size = std::stoi(request.getHeaderValue("x-fragment-size"));
-                    int x_timestamp_start = std::stoi(request.getHeaderValue("x-timestamp-start"));
-                    int x_timestamp_end = std::stoi(request.getHeaderValue("x-timestamp-end"));
-                    int duration = x_timestamp_end - x_timestamp_start;
+                    std::string url = request.getUrl();
+                    // check if manifest request
+                    if (url.find(".mpd") != std::string::npos)
+                    {
+                        url = url.substr(0, url.find(".mpd")) + "-no-list.mpd";
+                        std::cout << "Manifest requested, modified url: " << url << "\n";
+                    }
+                }
+                else if (request.getMethod() == "POST") 
+                {
+                    long long x_fragment_size = std::stoll(request.getHeaderValue("X-Fragment-Size"));
+                    long long x_timestamp_start = std::stoll(request.getHeaderValue("X-Timestamp-Start"));
+                    long long x_timestamp_end = std::stoll(request.getHeaderValue("X-Timestamp-End"));
+                    long long duration = x_timestamp_end - x_timestamp_start;
 
-
+                    double tput = (x_fragment_size * 8.0 / 1000.0) / (duration / 1000.0); // in Kbps
+                    clients_info[i].avg_throughput = config.alpha * tput + (1 - config.alpha) * clients_info[i].avg_throughput;
+                    std::cout << "tput: " << tput << '\n';
 
                     std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
                     send(server_conn, response.c_str(), response.size(), 0);
