@@ -6,6 +6,8 @@
 #include <arpa/inet.h> 
 #include <sys/time.h>
 #include <unistd.h>
+#include <vector>
+#include <cstring>
 
 #define MAXCLIENTS 30
 #define BUFFER_SIZE 8192
