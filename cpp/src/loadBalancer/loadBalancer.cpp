@@ -217,7 +217,7 @@ private:
         addr.s_addr = request.client_addr;
         std::string client_ip = inet_ntoa(addr);
         uint16_t request_id_h = ntohs(request.request_id);
-        spdlog::info("Received request from client {} with request_id {}", client_ip, request_id_h);
+        spdlog::info("Received request for client {} with request ID {}", client_ip, request_id_h);
         
         LoadBalancerResponse response;
         response.request_id = request.request_id;
