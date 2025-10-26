@@ -9,6 +9,8 @@
 #include <vector>
 #include <cstring>
 #include "pugixml.hpp"
+#include "../common/LoadBalancerProtocol.h"
+#include <random>
 #include <spdlog/spdlog.h>
 #include <map>
 
@@ -211,6 +213,66 @@ std::string readHttpResponse(int sockfd) {
     return result;
 }
 
+std::pair<std::string, int> queryLoadBalancer(const std::string& lb_ip, int lb_port, const std::string& client_ip) {
+    // Create socket to connect to load balancer
+    int lb_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lb_sock < 0) {
+        spdlog::error("Failed to create socket for load balancer");
+        return {"", 0};
+    }
+
+    // Connect to load balancer
+    struct sockaddr_in lb_addr;
+    lb_addr.sin_family = AF_INET;
+    lb_addr.sin_port = htons(lb_port);
+    struct hostent* server = gethostbyname(lb_ip.c_str());
+    if (!server) {
+        spdlog::error("Failed to resolve load balancer hostname");
+        close(lb_sock);
+        return {"", 0};
+    }
+    memcpy(&(lb_addr.sin_addr), server->h_addr, server->h_length);
+
+    if (connect(lb_sock, (struct sockaddr*)&lb_addr, sizeof(lb_addr)) < 0) {
+        spdlog::error("Failed to connect to load balancer");
+        close(lb_sock);
+        return {"", 0};
+    }
+
+    // Prepare request
+    LoadBalancerRequest request;
+    inet_pton(AF_INET, client_ip.c_str(), &request.client_addr);
+    
+    // Generate random request ID
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint16_t> dis(0, 65535);
+    request.request_id = htons(dis(gen));
+
+    // Send request
+    if (send(lb_sock, &request, sizeof(request), 0) < 0) {
+        spdlog::error("Failed to send request to load balancer");
+        close(lb_sock);
+        return {"", 0};
+    }
+
+    // Receive response
+    LoadBalancerResponse response;
+    int bytes_received = recv(lb_sock, &response, sizeof(response), 0);
+    close(lb_sock);
+
+    if (bytes_received != sizeof(response)) {
+        spdlog::error("Failed to receive complete response from load balancer");
+        return {"", 0};
+    }
+
+    // Convert response to host order
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &response.videoserver_addr, ip_str, INET_ADDRSTRLEN);
+    int port = ntohs(response.videoserver_port);
+
+    return {std::string(ip_str), port};
+}
 
 Config handle_args(int argc, char** argv)
 {
@@ -384,11 +446,28 @@ int main(int argc, char **argv)
                 return 1;
             }
 
+            int video_server_port = config.port;
+            std::string video_server_ip = config.host_name;
+            if (config.balance)
+            {
+                std::string client_ip = inet_ntoa(client_addr.sin_addr);
+                auto result = queryLoadBalancer(config.host_name, config.port, client_ip);
+                
+                if (result.first.empty() || result.second == 0) {
+                    spdlog::error("Failed to get video server from load balancer for client {}", client_ip);
+                    close(client_sock);
+                    continue;
+                }
+                
+                video_server_ip = result.first;
+                video_server_port = result.second;
+            }
+
             int server_conn = socket(AF_INET, SOCK_STREAM, 0);
             struct sockaddr_in server_addr;
             server_addr.sin_family = AF_INET;
-            server_addr.sin_port = htons(config.port);
-            struct hostent* server = gethostbyname(config.host_name.c_str());
+            server_addr.sin_port = htons(video_server_port);
+            struct hostent* server = gethostbyname(video_server_ip.c_str());
             memcpy(&(server_addr.sin_addr), server->h_addr, server->h_length);
             if (connect(server_conn, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0)
             {
@@ -570,472 +649,3 @@ int main(int argc, char **argv)
 
     return 0;
 }
-
-
-
-
-
-/*#include <iostream>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <cstring>
-#include <string>
-#include <map>
-#include <vector>
-#include <algorithm>
-#include <sstream>
-#include <cmath>
-#include <spdlog/spdlog.h>
-#include <cxxopts.hpp>
-
-#define MAXCLIENTS 30
-#define BUFFER_SIZE 8192
-
-struct Config
-{
-    bool balance = false;
-    int listen_port = 0;
-    std::string host_name = "";
-    int port = 0;
-    double alpha = 0.0;
-};
-
-class HttpMessage {
-public:
-    std::string method;
-    std::string uri;
-    std::string version;
-    std::map<std::string, std::string> headers;
-    std::string body;
-    
-    void parseHeaders(const std::string& headerSection) {
-        std::istringstream stream(headerSection);
-        std::string line;
-        
-        // First line is request/status line
-        if (std::getline(stream, line)) {
-            if (line.back() == '\r') line.pop_back();
-            std::istringstream lineStream(line);
-            lineStream >> method >> uri >> version;
-        }
-        
-        // Parse headers
-        while (std::getline(stream, line)) {
-            if (line.back() == '\r') line.pop_back();
-            if (line.empty()) break;
-            
-            size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                std::string key = line.substr(0, colon);
-                std::string value = line.substr(colon + 1);
-                
-                // Trim whitespace
-                value.erase(0, value.find_first_not_of(" \t"));
-                value.erase(value.find_last_not_of(" \t") + 1);
-                
-                // Convert key to lowercase for case-insensitive comparison
-                std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-                headers[key] = value;
-            }
-        }
-    }
-    
-    std::string getHeader(const std::string& key) const {
-        std::string lowerKey = key;
-        std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), ::tolower);
-        auto it = headers.find(lowerKey);
-        return (it != headers.end()) ? it->second : "";
-    }
-    
-    int getContentLength() const {
-        std::string cl = getHeader("content-length");
-        return cl.empty() ? 0 : std::stoi(cl);
-    }
-    
-    std::string toString() const {
-        std::ostringstream oss;
-        oss << method << " " << uri << " " << version << "\r\n";
-        for (const auto& header : headers) {
-            oss << header.first << ": " << header.second << "\r\n";
-        }
-        oss << "\r\n";
-        if (!body.empty()) {
-            oss << body;
-        }
-        return oss.str();
-    }
-};
-
-struct ClientInfo {
-    int client_fd;
-    int server_fd;
-    std::string client_ip;
-    int client_port;
-    std::string server_ip;
-    int server_port;
-    std::string uuid;
-    double avg_throughput = 0.0;
-    std::string current_video_path;
-};
-
-struct VideoInfo {
-    std::vector<int> bitrates;
-};
-
-std::map<int, ClientInfo> clients; // client_fd -> ClientInfo
-std::map<std::string, ClientInfo*> uuid_to_client; // uuid -> ClientInfo
-std::map<std::string, VideoInfo> video_cache; // video path -> available bitrates
-
-Config parseArgs(int argc, char** argv) {
-    cxxopts::Options options("miProxy", "Adaptive video streaming proxy");
-    
-    options.add_options()
-        ("b,balance", "Enable load balancing")
-        ("l,listen-port", "Listen port", cxxopts::value<int>())
-        ("h,hostname", "Hostname", cxxopts::value<std::string>())
-        ("p,port", "Port", cxxopts::value<int>())
-        ("a,alpha", "Alpha value", cxxopts::value<double>())
-        ("help", "Print help");
-    
-    auto result = options.parse(argc, argv);
-    
-    Config config;
-    config.balance = result["balance"].as<bool>();
-    
-    if (!result.count("listen-port") || !result.count("hostname") || 
-        !result.count("port") || !result.count("alpha")) {
-        std::cerr << "Error: missing required arguments\n";
-        exit(1);
-    }
-    
-    config.listen_port = result["listen-port"].as<int>();
-    config.host_name = result["hostname"].as<std::string>();
-    config.port = result["port"].as<int>();
-    config.alpha = result["alpha"].as<double>();
-    
-    if (config.port < 1024 || config.port > 65535) {
-        std::cerr << "Error: port must be in range [1024, 65535]\n";
-        exit(1);
-    }
-    
-    if (config.alpha < 0.0 || config.alpha > 1.0) {
-        std::cerr << "Error: alpha must be in range [0.0, 1.0]\n";
-        exit(1);
-    }
-    
-    return config;
-}
-
-int connectToServer(const std::string& hostname, int port) {
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) return -1;
-    
-    struct hostent* server = gethostbyname(hostname.c_str());
-    if (!server) {
-        close(sockfd);
-        return -1;
-    }
-    
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    server_addr.sin_port = htons(port);
-    
-    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        close(sockfd);
-        return -1;
-    }
-    
-    return sockfd;
-}
-
-std::string readHttpMessage(int sockfd) {
-    std::string result;
-    char buffer[1];
-    std::string headers;
-    
-    // Read until we find \r\n\r\n
-    while (true) {
-        int n = recv(sockfd, buffer, 1, 0);
-        if (n <= 0) return "";
-        
-        headers += buffer[0];
-        if (headers.size() >= 4 && 
-            headers.substr(headers.size() - 4) == "\r\n\r\n") {
-            break;
-        }
-    }
-    
-    result = headers;
-    
-    // Parse to get content length
-    HttpMessage msg;
-    msg.parseHeaders(headers);
-    int content_length = msg.getContentLength();
-    
-    if (content_length > 0) {
-        std::vector<char> body(content_length);
-        int total_read = 0;
-        while (total_read < content_length) {
-            int n = recv(sockfd, body.data() + total_read, content_length - total_read, 0);
-            if (n <= 0) break;
-            total_read += n;
-        }
-        result.append(body.data(), total_read);
-    }
-    
-    return result;
-}
-
-bool isManifestRequest(const std::string& uri) {
-    return uri.find(".mpd") != std::string::npos;
-}
-
-bool isVideoSegmentRequest(const std::string& uri) {
-    return uri.find("/video/") != std::string::npos && uri.find(".m4s") != std::string::npos;
-}
-
-std::string getVideoPath(const std::string& uri) {
-    size_t pos = uri.find("/video/");
-    if (pos == std::string::npos) return "";
-    return uri.substr(0, pos);
-}
-
-int selectBitrate(double avg_throughput, const std::vector<int>& bitrates) {
-    if (bitrates.empty()) return 0;
-    
-    double threshold = avg_throughput / 1.5;
-    int selected = bitrates[0];
-    
-    for (int bitrate : bitrates) {
-        if (bitrate <= threshold) {
-            selected = bitrate;
-        }
-    }
-    
-    return selected;
-}
-
-std::string modifySegmentRequest(const std::string& uri, int bitrate) {
-    // Find vid-XXX-seg pattern
-    size_t vid_pos = uri.find("vid-");
-    if (vid_pos == std::string::npos) return uri;
-    
-    size_t seg_pos = uri.find("-seg-", vid_pos);
-    if (seg_pos == std::string::npos) return uri;
-    
-    std::string prefix = uri.substr(0, vid_pos);
-    std::string suffix = uri.substr(seg_pos);
-    
-    return prefix + "vid-" + std::to_string(bitrate) + suffix;
-}
-
-int main(int argc, char **argv)
-{
-    Config config = parseArgs(argc, argv);
-    
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        spdlog::error("Failed to create socket");
-        return 1;
-    }
-    
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(config.listen_port);
-    
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        spdlog::error("Bind failed");
-        return 1;
-    }
-    
-    if (listen(server_fd, 10) < 0) {
-        spdlog::error("Listen failed");
-        return 1;
-    }
-    
-    spdlog::info("miProxy started");
-    
-    fd_set readfds;
-    int max_fd = server_fd;
-    
-    while (true) {
-        FD_ZERO(&readfds);
-        FD_SET(server_fd, &readfds);
-        max_fd = server_fd;
-        
-        for (const auto& pair : clients) {
-            FD_SET(pair.first, &readfds);
-            if (pair.second.server_fd > 0) {
-                FD_SET(pair.second.server_fd, &readfds);
-                max_fd = std::max(max_fd, pair.second.server_fd);
-            }
-            max_fd = std::max(max_fd, pair.first);
-        }
-        
-        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) {
-            spdlog::error("Select failed");
-            continue;
-        }
-        
-        // New connection
-        if (FD_ISSET(server_fd, &readfds)) {
-            struct sockaddr_in client_addr;
-            socklen_t addr_len = sizeof(client_addr);
-            int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
-            
-            if (client_fd >= 0) {
-                ClientInfo info;
-                info.client_fd = client_fd;
-                info.client_ip = inet_ntoa(client_addr.sin_addr);
-                info.client_port = ntohs(client_addr.sin_port);
-                info.server_ip = config.host_name;
-                info.server_port = config.port;
-                
-                // Connect to server
-                info.server_fd = connectToServer(config.host_name, config.port);
-                
-                clients[client_fd] = info;
-                
-                spdlog::info("New client socket connected with {}:{} on sockfd {}", 
-                    info.client_ip, info.client_port, client_fd);
-            }
-        }
-        
-        // Handle client requests
-        std::vector<int> to_remove;
-        for (auto& pair : clients) {
-            int client_fd = pair.first;
-            ClientInfo& info = pair.second;
-            
-            if (FD_ISSET(client_fd, &readfds)) {
-                std::string request_str = readHttpMessage(client_fd);
-                
-                if (request_str.empty()) {
-                    to_remove.push_back(client_fd);
-                    continue;
-                }
-
-                HttpMessage request;
-                request.parseHeaders(request_str);
-                
-                // Extract UUID if present
-                std::string uuid = request.getHeader("x-489-uuid");
-                if (!uuid.empty()) {
-                    info.uuid = uuid;
-                    uuid_to_client[uuid] = &info;
-                }
-                
-                // Handle POST to /on-fragment-received
-                if (request.method == "POST" && request.uri == "/on-fragment-received") {
-                    long long size = std::stoll(request.getHeader("x-fragment-size"));
-                    long long start = std::stoll(request.getHeader("x-timestamp-start"));
-                    long long end = std::stoll(request.getHeader("x-timestamp-end"));
-                    long long duration = end - start;
-                    
-                    double tput = (size * 8.0 / 1000.0) / (duration / 1000.0);
-                    
-                    if (info.avg_throughput == 0.0) {
-                        info.avg_throughput = tput;
-                    } else {
-                        info.avg_throughput = config.alpha * tput + (1 - config.alpha) * info.avg_throughput;
-                    }
-                    
-                    spdlog::info("Client {} finished receiving a segment of size {} bytes in {} ms. Throughput: {} Kbps. Avg Throughput: {} Kbps",
-                        uuid, size, duration, (int)tput, (int)info.avg_throughput);
-                    
-                    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-                    send(client_fd, response.c_str(), response.size(), 0);
-                    continue;
-                }
-                
-                // Handle manifest request
-                if (isManifestRequest(request.uri)) {
-                    std::string video_path = getVideoPath(request.uri);
-                    
-                    // Request no-list version for client
-                    HttpMessage modified_request = request;
-                    size_t mpd_pos = modified_request.uri.find(".mpd");
-                    modified_request.uri = modified_request.uri.substr(0, mpd_pos) + "-no-list.mpd";
-                    
-                    std::string modified_str = modified_request.toString();
-                    send(info.server_fd, modified_str.c_str(), modified_str.size(), 0);
-                    
-                    // spdlog::info("Manifest requested by {} forwarded to {}:{} for {}",
-                    //     uuid, info.server_ip, info.server_port, modified_request.uri);
-                    
-                    // If first time, also request regular manifest for parsing
-                    if (video_cache.find(video_path) == video_cache.end()) {
-                        // Parse bitrates from manifest (simplified - you should use pugixml)
-                        VideoInfo vinfo;
-                        vinfo.bitrates = {500, 800, 1100}; // Example bitrates
-                        video_cache[video_path] = vinfo;
-                    }
-                    
-                    continue;
-                }
-                
-                // Handle video segment request
-                if (isVideoSegmentRequest(request.uri)) {
-                    std::string video_path = getVideoPath(request.uri);
-                    auto it = video_cache.find(video_path);
-                    
-                    int selected_bitrate = 500; // default
-                    if (it != video_cache.end() && !it->second.bitrates.empty()) {
-                        selected_bitrate = selectBitrate(info.avg_throughput, it->second.bitrates);
-                    }
-                    
-                    HttpMessage modified_request = request;
-                    modified_request.uri = modifySegmentRequest(request.uri, selected_bitrate);
-                    
-                    std::string modified_str = modified_request.toString();
-                    send(info.server_fd, modified_str.c_str(), modified_str.size(), 0);
-                    
-                    spdlog::info("Segment requested by {} forwarded to {}:{} as {} at bitrate {} Kbps {}",
-                        uuid, info.server_ip, info.server_port, modified_request.uri, selected_bitrate, info.avg_throughput);
-                    
-                    continue;
-                }
-                
-                // Forward other requests as-is
-                send(info.server_fd, request_str.c_str(), request_str.size(), 0);
-            }
-            
-            // Handle server responses
-            if (info.server_fd > 0 && FD_ISSET(info.server_fd, &readfds)) {
-                std::string response = readHttpMessage(info.server_fd);
-                
-                if (response.empty()) {
-                    to_remove.push_back(client_fd);
-                } else {
-                    send(client_fd, response.c_str(), response.size(), 0);
-                }
-            }
-        }
-        
-        // Clean up disconnected clients
-        for (int fd : to_remove) {
-            auto it = clients.find(fd);
-            if (it != clients.end()) {
-                spdlog::info("Client socket sockfd {} disconnected", fd);
-                if (it->second.server_fd > 0) close(it->second.server_fd);
-                close(fd);
-                clients.erase(it);
-            }
-        }
-    }
-    
-    return 0;
-}*/
