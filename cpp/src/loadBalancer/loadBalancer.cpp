@@ -213,6 +213,11 @@ private:
         LoadBalancerRequest request;
         ssize_t n = recv(client_sock, &request, sizeof(request), 0);
 
+        if (n != sizeof(request)) {
+            close(client_sock);
+            return;
+        }
+
         struct in_addr addr;
         addr.s_addr = request.client_addr;
         std::string client_ip = inet_ntoa(addr);
@@ -271,8 +276,8 @@ int main(int argc, const char** argv)
     bool rr = false;
     bool geo = false;
     std::string servers_file;
-    if (argc != 6) {
-        std::cerr << "Error: missing or extra arguments\n";
+    if (argc > 6) {
+        std::cerr << "Error: extra arguments\n";
         return 1;
     }
     for (int i = 1; i < argc; i++) {
@@ -305,6 +310,10 @@ int main(int argc, const char** argv)
         }
         else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--geo") == 0) {
             geo = true;
+        }
+        else {
+            std::cerr << "Error: extra arguments\n";
+            return 1;
         }
     }
     if ((rr && geo) || (!rr && !geo)) {
